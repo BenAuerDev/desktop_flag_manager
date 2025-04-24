@@ -1,0 +1,173 @@
+name: Build AppImage and Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  APP_NAME: "Desktop Flag Manager"
+  APP_ID: "com.github.benauerdev.desktop_flag_manager"
+  APP_NAME_LOWER: "desktop_flag_manager"
+  ICON_SRC_PATH: "lib/assets/images/logo.png"
+  ICON_DEST_BASENAME: "desktop_flag_manager"
+
+jobs:
+  build-appimage:
+    name: Build AppImage 🐧
+    runs-on: ubuntu-22.04
+    env:
+      CC: /usr/bin/clang
+      CXX: /usr/bin/clang++
+    outputs:
+      appimage_name: ${{ steps.set_appimage_name.outputs.name }}
+      appimage_path: ${{ steps.set_appimage_name.outputs.path }}
+
+    steps:
+      - name: 📚 Git Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: 🔧 Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev cmake pkg-config fuse libfuse2 wget jq clang build-essential
+          wget -q -O appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+          sudo mv appimagetool /usr/local/bin/
+
+      - name: Configure Flutter for Linux Desktop
+        run: flutter config --enable-linux-desktop
+
+      - name: 🔄 Get Dependencies
+        run: flutter pub get
+
+      - name: Verify Compiler Setup
+        run: |
+          echo "--- Verifying Environment ---"
+          echo "Job-level CC: $CC"
+          echo "Job-level CXX: $CXX"
+          echo "--- Checking Paths ---"
+          which $CC || echo "ERROR: clang not found at $CC"
+          which $CXX || echo "ERROR: clang++ not found at $CXX"
+          echo "--- Checking /usr/bin directly ---"
+          ls -l /usr/bin/clang*
+          echo "--- Proceeding with build ---"
+
+      - name: 🏗️ Build Linux App
+        run: |
+          export CXX=/usr/bin/clang++
+          export CC=/usr/bin/clang
+          flutter build linux --release
+
+      - name: 🏗️ Prepare AppDir Structure
+        run: mkdir -p AppDir/usr/{bin,share/{applications,icons/hicolor/256x256/apps}}
+
+      - name: 📋 Copy Build Artifacts
+        run: cp -r build/linux/x64/release/bundle/* AppDir/usr/bin/
+
+      - name: 🖥️ Create Desktop Entry
+        run: |
+          cat > AppDir/${{ env.APP_NAME_LOWER }}.desktop << EOL
+          [Desktop Entry]
+          Name=${{ env.APP_NAME }}
+          Exec=${{ env.APP_NAME_LOWER }}
+          Icon=${{ env.ICON_DEST_BASENAME }}
+          Type=Application
+          Categories=Utility;Development;
+          Comment=Manage flags in Linux .desktop files
+          StartupWMClass=${{ env.APP_ID }}
+          EOL
+          cp AppDir/${{ env.APP_NAME_LOWER }}.desktop AppDir/usr/share/applications/
+
+      - name: 🎨 Copy Icon
+        run: |
+          echo "Checking for source icon at: ${{ env.ICON_SRC_PATH }}"
+          ls -l ${{ env.ICON_SRC_PATH }}
+          echo "Copying source icon to AppDir/${{ env.ICON_DEST_BASENAME }}.png"
+          cp ${{ env.ICON_SRC_PATH }} AppDir/${{ env.ICON_DEST_BASENAME }}.png
+          echo "Copying icon to final location: AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.ICON_DEST_BASENAME }}.png"
+          cp AppDir/${{ env.ICON_DEST_BASENAME }}.png AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.ICON_DEST_BASENAME }}.png
+
+      - name: 📜 Create AppRun Script
+        run: |
+          cat > AppDir/AppRun << EOL
+          #!/bin/sh
+          HERE=\$(dirname \$(readlink -f "\${0}"))
+          export PATH="\${HERE}/usr/bin:\${PATH}"
+          export LD_LIBRARY_PATH="\${HERE}/usr/lib:\${LD_LIBRARY_PATH}"
+          exec "\${HERE}/usr/bin/${{ env.APP_NAME_LOWER }}" "\$@"
+          EOL
+          chmod +x AppDir/AppRun
+
+      - name: Verify AppDir Contents Before Packaging
+        run: |
+          echo "--- Checking AppDir contents before packaging ---"
+          ls -lR AppDir
+          echo "--- Checking specific files ---"
+          echo "Desktop file path: AppDir/usr/share/applications/${{ env.APP_NAME_LOWER }}.desktop"
+          ls -l AppDir/usr/share/applications/${{ env.APP_NAME_LOWER }}.desktop || echo "Desktop file NOT FOUND"
+          cat AppDir/usr/share/applications/${{ env.APP_NAME_LOWER }}.desktop || echo "Desktop file is EMPTY or NOT FOUND"
+          echo "Icon file path: AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.ICON_DEST_BASENAME }}.png"
+          ls -l AppDir/usr/share/icons/hicolor/256x256/apps/${{ env.ICON_DEST_BASENAME }}.png || echo "Icon file NOT FOUND"
+          echo "--- End AppDir check ---"
+
+      - name: Determine AppImage Filename
+        id: set_appimage_name
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            GIT_HASH=$(git rev-parse --short HEAD)
+            VERSION="dev-${TIMESTAMP}-${GIT_HASH}"
+          fi
+          FILENAME="${{ env.APP_NAME_LOWER }}-${VERSION}-x86_64.AppImage"
+          echo "name=${FILENAME}" >> $GITHUB_OUTPUT
+          echo "path=./${FILENAME}" >> $GITHUB_OUTPUT
+
+      - name: 📦 Create AppImage
+        run: |
+          ARCH=x86_64 appimagetool AppDir "${{ steps.set_appimage_name.outputs.path }}"
+
+      - name: ⬆️ Upload AppImage Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-artifact
+          path: ${{ steps.set_appimage_name.outputs.path }}
+
+  create-release:
+    name: Publish GitHub Release 🚀
+    runs-on: ubuntu-latest
+    needs: build-appimage
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: 📥 Download AppImage Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-artifact
+          path: ./artifact
+
+      - name: 📝 List Downloaded Files (for debugging)
+        run: ls -lR ./artifact
+
+      - name: 🚀 Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          body: |
+            Released version ${{ github.ref_name }} of ${{ env.APP_NAME }}.
+            *(See CHANGELOG.md for details if available)*
+          draft: false
+          prerelease: contains(github.ref_name, '-')
+          files: ./artifact/${{ needs.build-appimage.outputs.appimage_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
